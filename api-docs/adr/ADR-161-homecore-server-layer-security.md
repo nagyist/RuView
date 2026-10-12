@@ -224,8 +224,9 @@ touched:
   SHA-256-checks the module, Ed25519-verifies the signature against
   `publisher_key`, and enforces a `PluginPolicy` trust allowlist
   (secure-default rejects unsigned/untrusted/tampered modules).
-- **HAP real pairing (P2)** — SRP/HKDF pairing + encrypted sessions; current
-  bridge is an accessory-mapping surface. **ACCEPTED-FUTURE (honestly stubbed).**
+- **HAP real pairing (P2)** — **DONE (2026-07-27 addendum below).** SRP/HKDF
+  Pair-Setup, transcript-authenticated Pair-Verify, encrypted sessions, and
+  administrator-only pairing management now land as one fail-closed boundary.
 - **`RunMode::Queued`/`Restart`/`max` ordering** — ~~`Single`/`Parallel` are
   honored; bounded queueing, restart-kill, and `max` concurrency are not yet
   wired (every non-Single mode is parallel).~~ **DONE — ADR-162 §A5.** Restart
@@ -265,3 +266,106 @@ Result at time of writing (all 0 failed):
   perform (B5).
 - Files kept under the 500-line guideline (`engine.rs` 462; behavioral tests
   moved to `tests/engine_behaviors.rs`).
+
+## Addendum — `homecore-api` follow-up security review (beyond-SOTA pass)
+
+A later network-facing review of `homecore-api` (the remote REST + WS attack
+surface) — independent of the ADR-154–159 sweep — found and fixed two real
+issues the original M7 pass (which focused on the WS auth bypass HC-WS-01, the
+reply-theater HC-WS-02, and the bin token provisioning HC-WS-08) did not catch.
+Both are LOW severity and reported at true severity.
+
+### HC-API-AUTH-01 — `GET /api/` was unauthenticated (FIXED)
+
+`rest::api_root` took no headers and unconditionally returned
+`200 {"message":"API running."}`, while every sibling route gates on
+`BearerAuth::from_headers`. HA's `APIStatusView` inherits `requires_auth = True`,
+so `/api/` must return **401** for a missing/wrong bearer. HA clients use the
+status route as a token-validation probe; a 200 told a bad-token client its
+token was valid and let an unauthenticated party confirm a live endpoint.
+LOW severity (the body is a static string; no entity/state data leaks).
+
+**Fix:** `api_root(headers, State)` now validates the bearer like `get_config`.
+**Pinned by** (fail-on-old, `tests/server_bin_auth.rs`):
+`api_root_rejects_missing_bearer`, `api_root_rejects_wrong_bearer` (both 200→401),
+guarded by `api_root_accepts_correct_bearer` (still 200 with a valid token).
+
+### HC-WS-LAG-01 — `subscribe_events` killed the stream on a broadcast lag (FIXED)
+
+The per-subscription task matched `Err(_) => break` on both broadcast
+`recv()` arms. `RecvError::Lagged(n)` (a slow consumer falling
+>`EVENT_CHANNEL_CAPACITY` = 4,096 events behind) is **recoverable** — the bus
+doc says "Lagged receivers must re-sync" and HA keeps the subscription alive
+across a lag. The old code treated the first lag as fatal, so after an event
+burst the client's stream went permanently silent with no error frame — a
+self-inflicted event-delivery DoS under load.
+
+**Fix:** `Lagged(_) => continue` (skip the dropped window, re-sync),
+`Closed => break`, on both the system and domain arms of the `select!`.
+**Pinned by** `subscription_survives_broadcast_lag` (`tests/ws_handshake.rs`):
+subscribes to a filtered event type, floods 6,000 unrelated events past the
+4,096 capacity to force a `Lagged`, then asserts a subsequent subscribed event
+is still delivered (old code: 5s-timeout panic).
+
+### Dimensions confirmed clean (with evidence)
+
+- **AuthN/AuthZ** — all 7 other REST handlers gate on `BearerAuth::from_headers`
+  → `LongLivedTokenStore::is_valid` before any work; the WS handshake validates
+  the `auth` token against the same store before the command loop, and
+  privileged commands are unreachable pre-`auth_ok`. Token compare is
+  `HashSet::contains` (content-independent timing — not the byte-`==` oracle of
+  ADR-157 §B4), so no timing-oracle finding. No route skips the gate; no
+  result-ignored check; no default/empty token accepted.
+- **Path traversal** — no route maps user input to a filesystem path (state is an
+  in-memory `DashMap`); `:entity_id` passes through `EntityId::parse`, a strict
+  `[a-z0-9_]+\.[a-z0-9_]+` ASCII allowlist that rejects `..`, `/`, `\`, and
+  absolute paths. No traversal surface.
+- **Injection** — no SQL, no shell/subprocess, no `format!`-into-response;
+  service/state bodies are typed `serde_json::Value` handed to the in-process
+  registry (HA-equivalent).
+- **Info-leak** — `ApiError` maps to fixed status + a typed `{message}`;
+  `ServiceError::HandlerFailed(String)` is integration-controlled (HA surfaces
+  the handler error too), never framework internals/paths/stack-traces — no
+  ADR-080-class leak.
+- **CORS** — explicit allowlist with `allow_credentials(false)` (HC-05),
+  not `permissive()`.
+- **De-magic** — no bare security-relevant literals in the crate worth
+  extracting (`EVENT_CHANNEL_CAPACITY` is already named in `homecore`; CORS
+  dev-default ports are documented).
+
+**Tests:** `homecore-api --no-default-features` **25 → 29** (+2 api-root auth,
++1 api-root accept-guard, +1 WS lag-survival), 0 failed. Workspace green.
+Python deterministic proof unchanged (homecore-api is off the signal proof
+path).
+
+## Addendum — HAP cryptographic boundary completed (2026-07-27)
+
+The P2 HAP deferral recorded above is closed as a single security boundary in
+`homecore-hap`; it was not replaced with a success-shaped partial protocol.
+
+- Pair-Setup M1-M6 uses RustCrypto SRP-6a with the RFC 5054 3072-bit group,
+  SHA-512 and HAP proof compatibility, followed by the specified
+  HKDF-SHA512, ChaCha20-Poly1305, and Ed25519 transcript construction.
+- Pair-Verify M1-M4 uses ephemeral X25519, strict Ed25519 transcript
+  verification, and separately derived directional control keys.
+- The TCP server changes to authenticated HAP record framing only after the
+  plaintext M4 response is written. Record lengths are authenticated, plaintext
+  is capped at 1024 bytes, counters are independent and monotonic, and any
+  authentication/replay/framing failure closes without an oracle response.
+- Accessory identity, signing seed, SRP verifier, and controller pairings share
+  one versioned, bounded, permission-checked, atomically replaced store. The raw
+  setup code is disclosed only on first provisioning and is not persisted.
+- Protected endpoints require an encrypted Pair-Verify session. Pairing
+  management rechecks current persisted administrator authority, handles the
+  last-admin invariant, updates mDNS paired state, and revokes live sessions.
+
+Evidence includes a deterministic HAP SRP vector, complete in-process
+Pair-Setup and Pair-Verify ceremonies, malformed/proof/transcript tests, record
+tamper/replay/oversize tests, persistence lifecycle tests, and a real TCP test
+that verifies Pair-Verify, accesses `/accessories` over encrypted records, then
+proves replay closes the connection.
+
+This closes the cryptographic implementation item, not the entire Apple Home
+product surface. Current-Apple/MFi interoperability has not been certified;
+transient/split Pair-Setup, writable/timed characteristics, resource endpoints,
+and persisted AID/IID allocation remain explicitly unsupported.
